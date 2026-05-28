@@ -9,34 +9,73 @@ const userSchema = new mongoose.Schema(
         },
 
         email: {
-        type: String,
-        required: true,
-        unique: true,
+            type: String,
+            required: true,
+            unique: true,
+            lowercase: true,
+            trim: true,
         },
 
         password: {
-        type: String,
-        required: true,
+            type: String,
+            required: function () {
+                return this.authProvider === "local";
+            },
         },
+
+        authProvider: {
+            type: String,
+            enum: ["local", "google"],
+            default: "local",
+        },
+
+        role: {
+            type: String,
+            enum: ["creator", "contributor", "admin"],
+            default: "creator",
+        },
+
+        googleId: {
+            type: String,
+            sparse: true,
+            unique: true,
+        },
+
+        avatar: {
+            type: String,
+        },
+
+        lastLoginAt: {
+            type: Date,
+        },
+        
+        collaborators: [{
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+        }],
     },
     {
         timestamps: true,
     }
 );
 
-const MongooseUserModel = mongoose.model("User", userSchema);
+const MongooseUserModel = mongoose.models.User || mongoose.model("User", userSchema);
 
 // In-memory mock storage
 const mockUsers = [];
 
 class MockUserModel {
     constructor(data) {
-        this._id = data._id || 'mock-user-id-' + Math.random().toString(36).substr(2, 9);
+        this._id = data._id || new mongoose.Types.ObjectId().toString();
         this.name = data.name;
         this.email = data.email;
         this.password = data.password;
+        this.role = data.role || "creator";
+        this.authProvider = data.authProvider || "local";
+        this.collaborators = data.collaborators || [];
         this.createdAt = new Date();
         this.updatedAt = new Date();
+        this.lastLoginAt = data.lastLoginAt;
     }
 
     async save() {
@@ -92,26 +131,30 @@ class MockUserModel {
 (async () => {
     const hashed = await bcrypt.hash("Password123!", 10);
     mockUsers.push({
-        _id: "mock-test-user-id",
+        _id: "000000000000000000000001",
         name: "Test User",
-        email: "test@local",
+        email: "test@local.com",
         password: hashed,
+        role: "creator",
+        authProvider: "local",
         createdAt: new Date(),
         updatedAt: new Date()
     });
 })();
 
-module.exports = new Proxy({}, {
-    get(target, prop) {
-        if (process.env.USE_MOCK_DB === "true") {
-            return MockUserModel[prop] || MockUserModel;
-        }
-        return MongooseUserModel[prop];
-    },
-    construct(target, args) {
-        if (process.env.USE_MOCK_DB === "true") {
-            return new MockUserModel(...args);
-        }
-        return new MongooseUserModel(...args);
-    }
-});
+function getActiveUserModel() {
+    return process.env.USE_MOCK_DB === "true"
+        ? MockUserModel
+        : MongooseUserModel;
+}
+
+function UserModel(data) {
+    const ActiveUserModel = getActiveUserModel();
+    return new ActiveUserModel(data);
+}
+
+UserModel.findOne = (...args) => getActiveUserModel().findOne(...args);
+UserModel.create = (...args) => getActiveUserModel().create(...args);
+UserModel.findById = (...args) => getActiveUserModel().findById(...args);
+
+module.exports = UserModel;

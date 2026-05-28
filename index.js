@@ -1,6 +1,7 @@
 require("dotenv").config({ path: ".env.local" });
 const cookieParser = require("cookie-parser");
 const express = require('express');
+const passport = require("passport");
 const path = require('path');
 
 // Validate required environment variables
@@ -25,12 +26,15 @@ const app = express();
 const connectDB = require("./connect");
 const authRoutes = require("./routes/auth");
 const collaborationRoutes = require('./routes/collaboration');
+const analyticsRoutes = require("./routes/analytics");
 const { acceptInvite, acceptInviteFromDashboard } = require('./controller/collaborationController');
 
 connectDB();
+require("./workers/analyticsRefreshWorker");
 app.use(cookieParser());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use(passport.initialize());
 
 app.set("view engine", "ejs");
 app.set('views', path.join(__dirname, 'view'));
@@ -59,6 +63,7 @@ const urlShortenerLimiter = rateLimit({
 app.use("/", authRoutes);
 
 const protect = require("./middleware/auth");
+const { preventContributorWrites } = require("./middleware/auth");
 
 const fs = require('fs');
 app.use(express.static(path.join(__dirname, 'public')));
@@ -75,11 +80,12 @@ const suggestionRoutes = require('./routes/suggestionRoutes');
 // ... after your other app.use() lines:
 app.use('/suggestions', protect, suggestionRoutes);
 app.use('/services/creator-crm', protect, collaborationRoutes);
-app.post('/dashboard/accept-invite', protect, acceptInviteFromDashboard);
+app.post('/dashboard/accept-invite', protect, preventContributorWrites, acceptInviteFromDashboard);
 app.get('/invites/accept/:token', acceptInvite);
 const Url = require('./model/url');
 
 app.use('/url', urlRoutes);
+app.use("/api/analytics", protect, analyticsRoutes);
 
 const uploadDir = "/tmp";
 
@@ -102,7 +108,7 @@ function buildShortenerViewModel(req, shortId = null, error = null) {
 }
 
 function buildAccountViewModel(userDoc, fallbackUser) {
-    const name = userDoc?.name || 'Creator';
+    const name = userDoc?.name || fallbackUser?.name || 'Creator';
     const initials = name
         .split(' ')
         .filter(Boolean)
@@ -113,21 +119,42 @@ function buildAccountViewModel(userDoc, fallbackUser) {
     return {
         id: fallbackUser.id,
         name,
-        email: userDoc?.email || '',
+        email: userDoc?.email || fallbackUser?.email || '',
         initials,
     };
 }
 
-app.get("/dashboard", protect, async (req, res) => {
-    const userDoc = await User.findById(req.user.id).select('name email').lean();
-    const invites = await Invite.find({ inviter: req.user.id }).lean();
-    const inviteSummary = {
-        total: invites.length,
-        pending: invites.filter((invite) => invite.status === 'pending').length,
-        accepted: invites.filter((invite) => invite.status === 'accepted').length,
-        expired: invites.filter((invite) => invite.status === 'expired').length,
-    };
+function isGuestContributor(user) {
+    return user?.role === 'guest_contributor';
+}
 
+function buildEmptyInviteSummary() {
+    return {
+        total: 0,
+        pending: 0,
+        accepted: 0,
+        expired: 0,
+    };
+}
+
+app.get("/dashboard", protect, async (req, res) => {
+    const userDoc = isGuestContributor(req.user)
+        ? null
+        : await User.findById(req.user.id).select('name email').lean();
+    
+    const inviteSummary = isGuestContributor(req.user)
+        ? buildEmptyInviteSummary()
+        : await Promise.all([
+            Invite.countDocuments({ inviter: req.user.id, status: 'pending' }),
+            Invite.countDocuments({ inviter: req.user.id, status: 'accepted' }),
+            Invite.countDocuments({ inviter: req.user.id, status: 'expired' })
+        ]).then(([pending, accepted, expired]) => ({
+            total: pending + accepted + expired,
+            pending,
+            accepted,
+            expired,
+        }));
+    
     res.render("dashboard", {
         user: buildAccountViewModel(userDoc, req.user),
         services,
@@ -138,7 +165,9 @@ app.get("/dashboard", protect, async (req, res) => {
 });
 
 app.get("/profile", protect, async (req, res) => {
-    const userDoc = await User.findById(req.user.id).select('name email').lean();
+    const userDoc = isGuestContributor(req.user)
+        ? null
+        : await User.findById(req.user.id).select('name email').lean();
 
     res.render("profile", { user: buildAccountViewModel(userDoc, req.user) });
 });
@@ -190,11 +219,13 @@ app.get('/services/:serviceKey', protect, (req, res) => {
     return res.render('coming-soon', { service });
 });
 
+const { isValidUrl } = require('./utils/validators');
+
 // URL shortener submit flow (dedicated service route)
-app.post('/services/url-shortener/shorten', protect, urlShortenerLimiter, async (req, res) => {
+app.post('/services/url-shortener/shorten', protect, preventContributorWrites, urlShortenerLimiter, async (req, res) => {
     const { redirectUrl } = req.body;
-    if (!redirectUrl) {
-        return res.render('home', buildShortenerViewModel(req, null, 'Please enter a URL.'));
+    if (!redirectUrl || !isValidUrl(redirectUrl)) {
+        return res.render('home', buildShortenerViewModel(req, null, 'Please enter a valid HTTP or HTTPS URL.'));
     }
 
     try {
@@ -214,7 +245,7 @@ app.post('/services/url-shortener/shorten', protect, urlShortenerLimiter, async 
 });
 
 // File upload endpoint
-app.post('/services/file-upload/upload', protect, uploadLimiter, upload.single('file'), (req, res) => {
+app.post('/services/file-upload/upload', protect, preventContributorWrites, uploadLimiter, upload.single('file'), (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
     }
